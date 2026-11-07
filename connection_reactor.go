@@ -27,6 +27,10 @@ func (c *connection) onHup(p Poll) error {
 	if !c.closeBy(poller) {
 		return nil
 	}
+	// The operator is detached from this point on, so no further bytes can
+	// be accepted; unfinished tickets end now (already completed ones are
+	// unaffected).
+	c.failFlushTickets(Exception(ErrEOF, "peer close"))
 	c.triggerRead(Exception(ErrEOF, "peer close"))
 	c.triggerWrite(Exception(ErrConnClosed, "peer close"))
 
@@ -118,29 +122,47 @@ func (c *connection) inputAck(n int) (err error) {
 }
 
 // outputs implements FDOperator.
+//
+// The FDOperator contract is "Outputs locks, OutputAck unlocks" when it returns
+// data: outputMu is held across the poller sendmsg and released in outputAck,
+// so a concurrent FlushAsync and the poller can never issue two sendmsg calls
+// whose ordering would disagree with the committed byte order. All operations
+// under outputMu are non-blocking.
 func (c *connection) outputs(vs [][]byte) (rs [][]byte, _ bool) {
+	c.outputMu.Lock()
 	if c.outputBuffer.IsEmpty() {
-		c.rw2r()
+		// No data remains: stop watching write events and release the lock.
+		c.outputDrainDoneLocked()
+		c.outputMu.Unlock()
 		return rs, false
 	}
 	rs = c.outputBuffer.GetBytes(vs)
+	if len(rs) == 0 {
+		// Defensive: Len reported data but GetBytes produced none.
+		c.outputDrainDoneLocked()
+		c.outputMu.Unlock()
+		return rs, false
+	}
+	// outputMu stays held; outputAck must be called by the poller next.
 	return rs, false
 }
 
 // outputAck implements FDOperator.
+// It is the unlock counterpart of outputs for a non-empty send, and advances
+// the same shared send counter a direct sendmsg uses, finishing the tickets
+// whose prefix has just been accepted.
 func (c *connection) outputAck(n int) (err error) {
 	if n > 0 {
-		c.outputBuffer.Skip(n)
-		c.outputBuffer.Release()
+		if e := c.outputBuffer.Skip(n); e == nil {
+			c.outputBuffer.Release()
+		}
+		// the n bytes are already accepted by the kernel, so the shared send
+		// counter advances even if buffer bookkeeping somehow disagreed
+		c.flushTickets.advance(int64(n))
 	}
 	if c.outputBuffer.IsEmpty() {
-		c.rw2r()
+		c.outputDrainDoneLocked()
 	}
+	c.outputMu.Unlock()
 	return nil
-}
-
-// rw2r removed the monitoring of write events.
-func (c *connection) rw2r() {
-	c.operator.Control(PollRW2R)
-	c.triggerWrite(nil)
 }

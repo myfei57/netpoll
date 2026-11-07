@@ -191,6 +191,22 @@ type Writer interface {
 	// Its behavior is equivalent to the io.Writer hat already has parameters(slice b).
 	Flush() (err error)
 
+	// FlushAsync submits all malloc data without blocking until it is sent,
+	// and returns a FlushTicket covering the submitted prefix.
+	//
+	// The ticket finishes once the last covered byte has been accepted by the
+	// LOCAL kernel send interface; it does not wait for output submitted by
+	// later Flush/FlushAsync calls, and neither peer reads nor TCP
+	// acknowledgements are involved. Bytes allocated with Malloc that have not
+	// been flushed yet are not covered. A submission with nothing pending
+	// returns an already finished ticket.
+	//
+	// Unlike Flush, FlushAsync returns as soon as the data is published and a
+	// first non-blocking send attempt has been made; the poller drains the
+	// remainder in the background. The memory backing WriteBinary data must
+	// stay valid until the ticket finishes, the same as until Flush returns.
+	FlushAsync() (ticket FlushTicket, err error)
+
 	// MallocLen returns the total length of the writable data that has not yet been submitted in the writer.
 	MallocLen() (length int)
 }

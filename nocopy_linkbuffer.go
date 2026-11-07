@@ -487,6 +487,17 @@ func (b *UnsafeLinkBuffer) Flush() (err error) {
 	return nil
 }
 
+// FlushAsync implements Writer.
+// A LinkBuffer has no kernel output of its own: flushing publishes the malloc
+// data locally and every submitted byte is immediately available, so the
+// returned ticket is already finished.
+func (b *UnsafeLinkBuffer) FlushAsync() (FlushTicket, error) {
+	if err := b.Flush(); err != nil {
+		return nil, err
+	}
+	return sharedReadyFlushTicket, nil
+}
+
 // Append implements Writer.
 func (b *UnsafeLinkBuffer) Append(w Writer) (err error) {
 	buf, ok := w.(*LinkBuffer)

@@ -180,6 +180,17 @@ func (w *zcWriter) Flush() (err error) {
 	return err
 }
 
+// FlushAsync implements Writer.
+// The wrapped io.Writer has no asynchronous completion channel, so this
+// performs the same synchronous write as Flush and returns a ticket that is
+// already finished when it returns.
+func (w *zcWriter) FlushAsync() (FlushTicket, error) {
+	if err := w.Flush(); err != nil {
+		return nil, err
+	}
+	return sharedReadyFlushTicket, nil
+}
+
 // MallocAck implements Writer.
 func (w *zcWriter) MallocAck(n int) (err error) {
 	return w.buf.MallocAck(n)

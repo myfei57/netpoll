@@ -49,9 +49,21 @@ type connection struct {
 	inputBuffer   *LinkBuffer
 	outputBuffer  *LinkBuffer
 	outputBarrier *barrier
-	maxSize       int       // The maximum size of data between two Release().
-	bookSize      int       // The size of data that can be read at once.
-	state         connState // Connection state should be changed sequentially.
+	// outputMu serializes every access to the committed output chain between
+	// the writer goroutine (Flush/Write/FlushAsync publish and direct sendmsg)
+	// and the poller goroutine (outputs/outputAck). It is only held over
+	// non-blocking operations, never while waiting for the poller.
+	outputMu sync.Mutex
+	// flushTickets tracks the absolute committed/sent positions and the
+	// unfinished FlushAsync tickets. Guarded by outputMu.
+	flushTickets flushTicketTracker
+	// syncFlushWaiting != 0 while a synchronous Flush/Write is blocked in
+	// waitFlush; it gates writeTrigger so asynchronous drains do not leave
+	// stale notifications for later synchronous calls.
+	syncFlushWaiting int32
+	maxSize          int       // The maximum size of data between two Release().
+	bookSize         int       // The size of data that can be read at once.
+	state            connState // Connection state should be changed sequentially.
 }
 
 var (
@@ -245,7 +257,13 @@ func (c *connection) Malloc(n int) (buf []byte, err error) {
 	if !c.IsActive() {
 		return nil, Exception(ErrConnClosed, "when malloc")
 	}
-	return c.outputBuffer.Malloc(n)
+	// The poller drains committed nodes concurrently once FlushAsync armed it.
+	// Growing the tail reads the flush node, so every submit op is serialized
+	// with outputs/outputAck by outputMu.
+	c.outputMu.Lock()
+	buf, err = c.outputBuffer.Malloc(n)
+	c.outputMu.Unlock()
+	return buf, err
 }
 
 // MallocLen implements Connection.
@@ -269,8 +287,33 @@ func (c *connection) Flush() error {
 	}
 	defer c.unlock(flushing)
 
-	c.outputBuffer.Flush()
-	return c.flush()
+	_, needWait, err := c.commitOutputLocked(false)
+	if !needWait {
+		return err
+	}
+	err = c.waitFlush()
+	atomic.StoreInt32(&c.syncFlushWaiting, 0)
+	return err
+}
+
+// FlushAsync implements Writer.
+// It publishes all malloc data and returns a FlushTicket covering the
+// submitted prefix, without waiting for the poller to drain the connection.
+// Bytes left in the malloc area by a later Malloc are not covered until the
+// next submission. With no output pending, the returned ticket is already
+// finished.
+func (c *connection) FlushAsync() (FlushTicket, error) {
+	if !c.IsActive() {
+		return nil, Exception(ErrConnClosed, "when flush async")
+	}
+
+	if !c.lock(flushing) {
+		return nil, Exception(ErrConcurrentAccess, "when flush async")
+	}
+	defer c.unlock(flushing)
+
+	ticket, _, _ := c.commitOutputLocked(true)
+	return ticket, nil
 }
 
 // MallocAck implements Connection.
@@ -278,7 +321,12 @@ func (c *connection) MallocAck(n int) (err error) {
 	if !c.IsActive() {
 		return Exception(ErrConnClosed, "when malloc ack")
 	}
-	return c.outputBuffer.MallocAck(n)
+	// MallocAck can shrink and re-slice the flush node, which the poller may
+	// be reading, so serialize it with output acknowledgement.
+	c.outputMu.Lock()
+	err = c.outputBuffer.MallocAck(n)
+	c.outputMu.Unlock()
+	return err
 }
 
 // Append implements Connection.
@@ -286,7 +334,11 @@ func (c *connection) Append(w Writer) (err error) {
 	if !c.IsActive() {
 		return Exception(ErrConnClosed, "when append")
 	}
-	return c.outputBuffer.Append(w)
+	// Append splices nodes at the flush/write frontier the poller may scan.
+	c.outputMu.Lock()
+	err = c.outputBuffer.Append(w)
+	c.outputMu.Unlock()
+	return err
 }
 
 // WriteString implements Connection.
@@ -294,7 +346,10 @@ func (c *connection) WriteString(s string) (n int, err error) {
 	if !c.IsActive() {
 		return 0, Exception(ErrConnClosed, "when write string")
 	}
-	return c.outputBuffer.WriteString(s)
+	c.outputMu.Lock()
+	n, err = c.outputBuffer.WriteString(s)
+	c.outputMu.Unlock()
+	return n, err
 }
 
 // WriteBinary implements Connection.
@@ -302,7 +357,10 @@ func (c *connection) WriteBinary(b []byte) (n int, err error) {
 	if !c.IsActive() {
 		return 0, Exception(ErrConnClosed, "when write binary")
 	}
-	return c.outputBuffer.WriteBinary(b)
+	c.outputMu.Lock()
+	n, err = c.outputBuffer.WriteBinary(b)
+	c.outputMu.Unlock()
+	return n, err
 }
 
 // WriteDirect implements Connection.
@@ -310,7 +368,12 @@ func (c *connection) WriteDirect(p []byte, remainCap int) (err error) {
 	if !c.IsActive() {
 		return Exception(ErrConnClosed, "when write direct")
 	}
-	return c.outputBuffer.WriteDirect(p, remainCap)
+	// WriteDirect splits and re-links nodes starting at the flush node that
+	// the poller may be reading, so serialize it with output acknowledgement.
+	c.outputMu.Lock()
+	err = c.outputBuffer.WriteDirect(p, remainCap)
+	c.outputMu.Unlock()
+	return err
 }
 
 // WriteByte implements Connection.
@@ -318,7 +381,10 @@ func (c *connection) WriteByte(b byte) (err error) {
 	if !c.IsActive() {
 		return Exception(ErrConnClosed, "when write byte")
 	}
-	return c.outputBuffer.WriteByte(b)
+	c.outputMu.Lock()
+	err = c.outputBuffer.WriteByte(b)
+	c.outputMu.Unlock()
+	return err
 }
 
 // ------------------------------------------ implement net.Conn ------------------------------------------
@@ -345,10 +411,18 @@ func (c *connection) Write(p []byte) (n int, err error) {
 	}
 	defer c.unlock(flushing)
 
+	c.outputMu.Lock()
 	dst, _ := c.outputBuffer.Malloc(len(p))
+	c.outputMu.Unlock()
 	n = copy(dst, p)
-	c.outputBuffer.Flush()
-	err = c.flush()
+	_, needWait, ferr := c.commitOutputLocked(false)
+	if ferr != nil {
+		return n, ferr
+	}
+	if needWait {
+		err = c.waitFlush()
+		atomic.StoreInt32(&c.syncFlushWaiting, 0)
+	}
 	return n, err
 }
 
@@ -425,6 +499,10 @@ func (c *connection) initFinalizer() {
 	c.AddCloseCallback(func(connection Connection) (err error) {
 		c.stop(flushing)
 		c.operator.Free()
+		// After Free no poller outputAck can run, so the accepted prefix is
+		// final. End every unfinished FlushAsync ticket once before the
+		// output buffer is recycled.
+		c.failFlushTickets(Exception(ErrConnClosed, "when close"))
 		if err = c.netFD.Close(); err != nil {
 			logger.Printf("NETPOLL: netFD close failed: %v", err)
 		}
@@ -522,33 +600,126 @@ RET:
 	return err
 }
 
-// flush writes data directly.
-func (c *connection) flush() error {
+// commitOutputLocked publishes all malloc data, advances the shared
+// committed/sent accounting and performs one non-blocking send round, arming
+// the poller if data remains. The caller must hold the flushing CAS lock; the
+// whole operation runs under c.outputMu but never waits for the poller.
+//
+// For async submissions it registers and returns a FlushTicket. Any send or
+// arming failure is recorded on the ticket (which is always returned once the
+// commit succeeds), so the returned error is always nil in async mode.
+//
+// For synchronous submissions it marks a sync waiter before arming the poller
+// and reports needWait so the caller blocks in waitFlush outside the mutex.
+func (c *connection) commitOutputLocked(async bool) (ticket FlushTicket, needWait bool, err error) {
+	c.outputMu.Lock()
+	defer c.outputMu.Unlock()
+
+	pendingBefore := c.outputBuffer.Len()
+	if ferr := c.outputBuffer.Flush(); ferr != nil {
+		return nil, false, ferr
+	}
+	c.flushTickets.committed += int64(c.outputBuffer.Len() - pendingBefore)
+
+	if async {
+		if c.outputBuffer.IsEmpty() {
+			// Nothing pending: all committed bytes are already accepted.
+			return sharedReadyFlushTicket, false, nil
+		}
+		ticket = c.flushTickets.register(c.flushTickets.committed)
+		// A send failure ends the ticket (with the accepted prefix) instead
+		// of being returned as the call error.
+		_ = c.kickOutputLocked()
+		if c.outputBuffer.IsEmpty() {
+			return ticket, false, nil
+		}
+		if cerr := c.operator.Control(PollR2RW); cerr != nil {
+			cerr = Exception(cerr, "when flush async")
+			c.teardownOutputLocked(cerr)
+		}
+		return ticket, false, nil
+	}
+
+	if err = c.kickOutputLocked(); err != nil {
+		return nil, false, err
+	}
+	if c.outputBuffer.IsEmpty() {
+		return nil, false, nil
+	}
+	// Publish the waiter flag before arming: the poller checks it under the
+	// same outputMu in outputDrainDoneLocked, so the wake cannot be missed.
+	atomic.StoreInt32(&c.syncFlushWaiting, 1)
+	if cerr := c.operator.Control(PollR2RW); cerr != nil {
+		atomic.StoreInt32(&c.syncFlushWaiting, 0)
+		return nil, false, Exception(cerr, "when flush")
+	}
+	return nil, true, nil
+}
+
+// kickOutputLocked performs one non-blocking sendmsg over the committed
+// output and accounts the accepted bytes. EAGAIN leaves the remainder to the
+// armed poller. A fatal send error accepts any partial n, ends the pending
+// tickets (each reporting its accepted prefix), disarms write polling and
+// wakes a synchronous waiter.
+func (c *connection) kickOutputLocked() error {
 	if c.outputBuffer.IsEmpty() {
 		return nil
 	}
 	bs := c.outputBuffer.GetBytes(c.outputBarrier.bs)
 	n, err := sendmsg(c.fd, bs, c.outputBarrier.ivs, false)
 	if err != nil && err != syscall.EAGAIN {
-		return Exception(err, "when flush")
+		if n > 0 {
+			c.outputConsumedLocked(n)
+		}
+		sendErr := Exception(err, "when flush")
+		c.teardownOutputLocked(sendErr)
+		return sendErr
 	}
 	if n > 0 {
-		err = c.outputBuffer.Skip(n)
-		c.outputBuffer.Release()
-		if err != nil {
-			return Exception(err, "when flush")
-		}
+		c.outputConsumedLocked(n)
 	}
-	// return if write all buffer.
-	if c.outputBuffer.IsEmpty() {
-		return nil
-	}
-	err = c.operator.Control(PollR2RW)
-	if err != nil {
-		return Exception(err, "when flush")
-	}
+	return nil
+}
 
-	return c.waitFlush()
+// outputConsumedLocked skips and releases n accepted bytes and advances the
+// single shared send counter, finishing every ticket whose prefix is now
+// fully accepted. n must come from a successful send call on this output.
+func (c *connection) outputConsumedLocked(n int) {
+	if err := c.outputBuffer.Skip(n); err != nil {
+		// The kernel accepted n bytes that the buffer cannot skip; this must
+		// not happen as GetBytes produced n. Keep the ticket accounting tied
+		// to the real syscall result instead of stalling tickets forever.
+		logger.Printf("NETPOLL: output buffer skip %d failed: %v", n, err)
+	} else {
+		c.outputBuffer.Release()
+	}
+	c.flushTickets.advance(int64(n))
+}
+
+// teardownOutputLocked disarms write polling, finishes unfinished tickets with
+// cause and wakes a blocked synchronous flush, if any.
+func (c *connection) teardownOutputLocked(cause error) {
+	_ = c.operator.Control(PollRW2R)
+	c.flushTickets.fail(cause)
+	c.triggerWrite(cause)
+}
+
+// outputDrainDoneLocked disarms write polling after the committed output
+// became empty. A synchronous waiter is woken; asynchronous drains do not
+// consume the single-slot writeTrigger.
+func (c *connection) outputDrainDoneLocked() {
+	_ = c.operator.Control(PollRW2R)
+	if atomic.LoadInt32(&c.syncFlushWaiting) != 0 {
+		c.triggerWrite(nil)
+	}
+}
+
+// failFlushTickets finishes unfinished tickets when the connection terminates
+// (peer hangup or local close). Already completed tickets stay successful.
+func (c *connection) failFlushTickets(cause error) {
+	c.outputMu.Lock()
+	c.flushTickets.fail(cause)
+	c.outputMu.Unlock()
 }
 
 func (c *connection) waitFlush() (err error) {
@@ -559,34 +730,42 @@ func (c *connection) waitFlush() (err error) {
 			return Exception(ErrWriteTimeout, c.remoteAddr.String())
 		}
 	}
-	if timeout == 0 {
-		return <-c.writeTrigger
-	}
-
-	// set write timeout
-	if c.writeTimer == nil {
-		c.writeTimer = time.NewTimer(timeout)
-	} else {
-		c.writeTimer.Reset(timeout)
-	}
-
-	select {
-	case err = <-c.writeTrigger:
-		if !c.writeTimer.Stop() { // clean timer
-			<-c.writeTimer.C
+	// A nil notification only counts when the buffer is really empty. This
+	// rejects stale notifications (e.g. a poller outputAck landing just after
+	// a prior write timeout) while genuine close/hup errors always terminate
+	// the wait. An asynchronous drain never notifies this channel.
+	for {
+		if timeout == 0 {
+			err = <-c.writeTrigger
+		} else {
+			if c.writeTimer == nil {
+				c.writeTimer = time.NewTimer(timeout)
+			} else {
+				c.writeTimer.Reset(timeout)
+			}
+			select {
+			case err = <-c.writeTrigger:
+				if !c.writeTimer.Stop() { // clean timer
+					<-c.writeTimer.C
+				}
+			case <-c.writeTimer.C:
+				select {
+				// try fetch writeTrigger if both cases fired
+				case err = <-c.writeTrigger:
+				default:
+					// if timeout, remove write event from poller
+					// we cannot flush it again, since we don't if the poller is still process outputBuffer
+					c.operator.Control(PollRW2R)
+					return Exception(ErrWriteTimeout, c.remoteAddr.String())
+				}
+			}
 		}
-		return err
-	case <-c.writeTimer.C:
-		select {
-		// try fetch writeTrigger if both cases fires
-		case err = <-c.writeTrigger:
+		if err != nil {
 			return err
-		default:
 		}
-		// if timeout, remove write event from poller
-		// we cannot flush it again, since we don't if the poller is still process outputBuffer
-		c.operator.Control(PollRW2R)
-		return Exception(ErrWriteTimeout, c.remoteAddr.String())
+		if c.outputBuffer.IsEmpty() {
+			return nil
+		}
 	}
 }
 

@@ -131,6 +131,13 @@ func (b *SafeLinkBuffer) Flush() (err error) {
 	return b.UnsafeLinkBuffer.Flush()
 }
 
+// FlushAsync implements Writer.
+func (b *SafeLinkBuffer) FlushAsync() (ticket FlushTicket, err error) {
+	b.Lock()
+	defer b.Unlock()
+	return b.UnsafeLinkBuffer.FlushAsync()
+}
+
 // Append implements Writer.
 func (b *SafeLinkBuffer) Append(w Writer) (err error) {
 	b.Lock()
