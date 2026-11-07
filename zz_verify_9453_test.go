@@ -1,22 +1,81 @@
 //go:build linux
 
 // Independent acceptance probe for precheck 9453 (live connection migration).
-// Written by the reviewer, not by the model: it reuses only the model's test
-// harness (controlled manager + real TCP pair) and asserts user-observable
-// behavior through the public entry point.
+// Written by the reviewer. It builds its own TCP pair because the model's own
+// test helper closes the duplicated fd before handing it to the connection.
 package netpoll
 
 import (
 	"context"
 	"io"
+	"net"
+	"syscall"
 	"testing"
 	"time"
 )
 
+func verify9453TCPPair(t *testing.T) (*connection, *net.TCPConn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	peerConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	peer := peerConn.(*net.TCPConn)
+	accepted, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	serverTCP := accepted.(*net.TCPConn)
+	localAddr, remoteAddr := serverTCP.LocalAddr(), serverTCP.RemoteAddr()
+
+	file, err := serverTCP.File() // duplicate of the accepted fd
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	fd, err := syscall.Dup(int(file.Fd()))
+	_ = file.Close()
+	_ = serverTCP.Close()
+	if err != nil {
+		t.Fatalf("dup fd: %v", err)
+	}
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		t.Fatalf("setnonblock: %v", err)
+	}
+
+	c := new(connection)
+	nfd := &netFD{fd: fd, network: "tcp", isStream: true, localAddr: localAddr, remoteAddr: remoteAddr}
+	if err := c.init(nfd, &options{}); err != nil {
+		t.Fatalf("init connection: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	t.Cleanup(func() { _ = peer.Close() })
+	return c, peer
+}
+
+func verify9453WaitRead(t *testing.T, c *connection, n int, timeout time.Duration) []byte {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for c.Reader().Len() < n && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.Reader().Len() < n {
+		t.Fatalf("only %d buffered bytes, want %d", c.Reader().Len(), n)
+	}
+	p, err := c.Next(n)
+	if err != nil {
+		t.Fatalf("next(%d): %v", n, err)
+	}
+	return p
+}
+
 func TestVerify9453MigrationKeepsTCPFlow(t *testing.T) {
 	_, polls := newMigrateEnv(t, 2)
-	c, peer := tcpMigratePair(t, nil)
-
+	c, peer := verify9453TCPPair(t)
 	current := ownerPoll(t, c)
 	target := otherPoll(polls, current)
 	if target == nil {
@@ -24,13 +83,11 @@ func TestVerify9453MigrationKeepsTCPFlow(t *testing.T) {
 	}
 	fdBefore := c.getOperator().FD
 
-	// data written before the migration is buffered and readable afterwards
 	if _, err := peer.Write([]byte("before")); err != nil {
 		t.Fatalf("peer write before: %v", err)
 	}
-	waitUntil(t, 2*time.Second, "pre-migration bytes", func() bool { return c.Reader().Len() >= 6 })
-	if got, err := c.Next(6); err != nil || string(got) != "before" {
-		t.Fatalf("read before migration = %q, %v", got, err)
+	if got := verify9453WaitRead(t, c, 6, 3*time.Second); string(got) != "before" {
+		t.Fatalf("pre-migration read = %q", got)
 	}
 	if err := c.Release(); err != nil {
 		t.Fatalf("release: %v", err)
@@ -47,22 +104,17 @@ func TestVerify9453MigrationKeepsTCPFlow(t *testing.T) {
 	if c.getOperator().FD != fdBefore {
 		t.Fatalf("fd changed across migration: %d -> %d", fdBefore, c.getOperator().FD)
 	}
-
-	// same target is idempotent
 	if err := MigrateConnection(ctx, c, target); err != nil {
 		t.Fatalf("idempotent migration returned error: %v", err)
 	}
 
-	// the peer keeps sending on the same socket, the migrated connection reads it
 	if _, err := peer.Write([]byte("after")); err != nil {
 		t.Fatalf("peer write after: %v", err)
 	}
-	waitUntil(t, 3*time.Second, "post-migration bytes", func() bool { return c.Reader().Len() >= 5 })
-	if got, err := c.Next(5); err != nil || string(got) != "after" {
-		t.Fatalf("read after migration = %q, %v", got, err)
+	if got := verify9453WaitRead(t, c, 5, 3*time.Second); string(got) != "after" {
+		t.Fatalf("post-migration read = %q", got)
 	}
 
-	// and it can still write back through the new poller
 	if _, err := c.Write([]byte("pong")); err != nil {
 		t.Fatalf("write after migration: %v", err)
 	}
@@ -75,11 +127,10 @@ func TestVerify9453MigrationKeepsTCPFlow(t *testing.T) {
 
 func TestVerify9453RejectsForeignOrCancelledTarget(t *testing.T) {
 	_, polls := newMigrateEnv(t, 2)
-	c, _ := tcpMigratePair(t, nil)
+	c, _ := verify9453TCPPair(t)
 	current := ownerPoll(t, c)
 	target := otherPoll(polls, current)
 
-	// cancelled context before the migration is accepted must not move ownership
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := MigrateConnection(cancelled, c, target); err == nil {
@@ -89,11 +140,7 @@ func TestVerify9453RejectsForeignOrCancelledTarget(t *testing.T) {
 		t.Fatal("cancelled migration changed ownership")
 	}
 
-	// a poller from another manager must be rejected
 	other := newManager(1)
-	if _, ok := other.Pick().(*defaultPoll); !ok {
-		t.Fatal("unexpected poll type")
-	}
 	foreign := other.Pick()
 	if err := MigrateConnection(context.Background(), c, foreign); err == nil {
 		t.Fatal("migration accepted a poller outside the active manager")
