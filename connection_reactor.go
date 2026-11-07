@@ -107,6 +107,22 @@ func (c *connection) inputAck(n int) (err error) {
 		c.maxSize = mallocMax
 	}
 
+	// A PROXY v2 preamble on a trusted peer must be fully consumed before
+	// any user callback runs. The driver is fed by every read while the
+	// handshake is pending and suppresses the normal OnRequest path; when
+	// it finishes it kicks OnConnect/OnRequest itself (including payload
+	// that arrived in this same read packet). A failed handshake keeps
+	// swallowing bytes until the connection is detached/closed.
+	if c.proxy != nil {
+		if c.proxy.intercepts() {
+			c.proxy.drive(c)
+			return nil
+		}
+		if !c.proxy.finished() {
+			return nil
+		}
+	}
+
 	needTrigger := true
 	if length == n { // first start onRequest
 		needTrigger = c.onRequest()

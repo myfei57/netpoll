@@ -111,6 +111,13 @@ func (c *connection) onPrepare(opts *options) (err error) {
 	}
 	// prepare may close the connection.
 	if c.IsActive() {
+		// Arm PROXY v2 reception before registering read events: the trust
+		// decision uses the original socket peer, and the handshake is
+		// driven asynchronously by later read events (never waited for
+		// synchronously here).
+		if opts != nil {
+			c.armProxyProtocol(opts.proxyProtocol)
+		}
 		return c.register()
 	}
 	return nil
@@ -118,6 +125,12 @@ func (c *connection) onPrepare(opts *options) (err error) {
 
 // onConnect is responsible for executing onRequest if there is new data coming after onConnect callback finished.
 func (c *connection) onConnect() {
+	// A trusted PROXY v2 preamble must complete successfully before
+	// OnConnect. The handshake driver invokes onConnect again once it
+	// finishes; a failed handshake is being closed and never proceeds.
+	if c.proxy != nil && !c.proxy.finished() {
+		return
+	}
 	onConnect, _ := c.onConnectCallback.Load().(OnConnect)
 	if onConnect == nil {
 		c.changeState(connStateNone, connStateConnected)

@@ -22,13 +22,14 @@ type Option struct {
 }
 
 type options struct {
-	onPrepare    OnPrepare
-	onConnect    OnConnect
-	onDisconnect OnDisconnect
-	onRequest    OnRequest
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	idleTimeout  time.Duration
+	onPrepare     OnPrepare
+	onConnect     OnConnect
+	onDisconnect  OnDisconnect
+	onRequest     OnRequest
+	readTimeout   time.Duration
+	writeTimeout  time.Duration
+	idleTimeout   time.Duration
+	proxyProtocol *ProxyProtocolConfig
 }
 
 // WithOnPrepare registers the OnPrepare method to EventLoop.

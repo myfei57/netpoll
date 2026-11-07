@@ -52,6 +52,7 @@ type connection struct {
 	maxSize       int       // The maximum size of data between two Release().
 	bookSize      int       // The size of data that can be read at once.
 	state         connState // Connection state should be changed sequentially.
+	proxy         *proxyState
 }
 
 var (
