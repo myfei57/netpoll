@@ -197,16 +197,35 @@ func TestVerify9445UntrustedPeerIsUntouched(t *testing.T) {
 	conn := verifyDialWrite(t, ln.Addr(), [][]byte{header, []byte("plain")})
 	defer conn.Close()
 
-	verifyWaitEvents(t, s, "connect,request,", 5*time.Second)
+	// An untrusted peer must be handled as an ordinary connection: callbacks run
+	// and every byte (including the header-looking prefix) reaches the reader.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		n := len(s.payload)
+		ev := len(s.events)
+		s.mu.Unlock()
+		if n >= len(header)+len("plain") && ev >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	s.mu.Lock()
-	payload := s.payload
+	payload := append([]byte(nil), s.payload...)
 	had := s.hadInfo
+	events := append([]string(nil), s.events...)
 	s.mu.Unlock()
+	if len(events) < 2 || events[0] != "connect" {
+		t.Fatalf("callbacks for an untrusted peer = %v, want connect first", events)
+	}
 	if had {
 		t.Fatal("untrusted peer produced ProxyInfo")
 	}
 	if len(payload) != len(header)+len("plain") {
 		t.Fatalf("untrusted peer payload length = %d, want %d (header must not be consumed)", len(payload), len(header)+5)
+	}
+	if got := string(payload); got != string(header)+"plain" {
+		t.Fatalf("untrusted peer payload = %q, want the verbatim bytes", got)
 	}
 }
 
