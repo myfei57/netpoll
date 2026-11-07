@@ -141,6 +141,11 @@ func (c *connection) outputAck(n int) (err error) {
 
 // rw2r removed the monitoring of write events.
 func (c *connection) rw2r() {
-	c.operator.Control(PollRW2R)
+	// This runs on the connection's unique owner poller, so the operator pointer
+	// is stable here; no migration lock is needed (and taking one could stall
+	// the new owner poller while a migration finishes).
+	if operator := c.getOperator(); operator != nil {
+		_ = operator.Control(PollRW2R)
+	}
 	c.triggerWrite(nil)
 }

@@ -168,16 +168,17 @@ func TestTCPConnectionIsHealthyForReuseRejectsPeerClose(t *testing.T) {
 func TestTCPConnectionIsHealthyForReuseRejectsDetachedOperatorBeforeOnHup(t *testing.T) {
 	// Arrange: publish only detached and restore it before shared-poller cleanup.
 	conn, _ := newReusableTCPPair(t)
-	atomic.StoreInt32(&conn.operator.detached, 1)
+	op := conn.getOperator()
+	atomic.StoreInt32(&op.detached, 1)
 	t.Cleanup(func() {
-		atomic.StoreInt32(&conn.operator.detached, 0)
+		atomic.StoreInt32(&op.detached, 0)
 	})
 
 	// Assert the fixture isolates detach-before-OnHup, then reject reuse.
 	if !conn.IsActive() {
 		t.Fatal("probe setup unexpectedly published the closing state")
 	}
-	if conn.operator.isUnused() {
+	if op.isUnused() {
 		t.Fatal("probe setup unexpectedly released the operator")
 	}
 	if conn.IsHealthyForReuse(time.Second) {
@@ -232,7 +233,7 @@ func TestTCPConnectionIsHealthyForReuseRejectsPeerReset(t *testing.T) {
 // fail-closed EINTR classification without installing process-wide signals.
 func TestTCPConnectionIsHealthyForReuseRejectsInterruptedProbe(t *testing.T) {
 	conn, _ := newReusableTCPPair(t)
-	if conn.isHealthyForReuseAfterPeek(conn.operator, syscall.EINTR) {
+	if conn.isHealthyForReuseAfterPeek(conn.getOperator(), syscall.EINTR) {
 		t.Fatal("interrupted nonblocking probe must fail closed")
 	}
 }
@@ -384,8 +385,9 @@ func newReusableTCPPair(t testing.TB) (*TCPConnection, net.Conn) {
 // release function so tests can safely release it explicitly and in cleanup.
 func acquireOperatorForReuseTest(t *testing.T, conn *TCPConnection) func() {
 	t.Helper()
+	op := conn.getOperator()
 	deadline := time.Now().Add(time.Second)
-	for !conn.operator.do() {
+	for !op.do() {
 		if time.Now().After(deadline) {
 			t.Fatal("acquire operator timed out")
 		}
@@ -394,7 +396,7 @@ func acquireOperatorForReuseTest(t *testing.T, conn *TCPConnection) func() {
 
 	var once sync.Once
 	release := func() {
-		once.Do(conn.operator.done)
+		once.Do(op.done)
 	}
 	t.Cleanup(release)
 	return release

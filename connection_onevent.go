@@ -269,9 +269,16 @@ func (c *connection) closeCallback(needLock, needDetach bool) (err error) {
 	if needLock && !c.lock(processing) {
 		return nil
 	}
-	if needDetach && c.operator.poll != nil { // If Close is called during OnPrepare, poll is not registered.
+	// A live migration may be rewiring the operator to another poller. Wait
+	// for it to finish before detaching or freeing the operator, otherwise the
+	// finalizer could recycle an operator that migration is registering.
+	// Migration never takes the processing lock, so this cannot deadlock.
+	c.migMu.RLock()
+	defer c.migMu.RUnlock()
+	operator := c.getOperator()
+	if needDetach && operator != nil && operator.poll != nil { // If Close is called during OnPrepare, poll is not registered.
 		// PollDetach only happen when user call conn.Close() or poller detect error
-		if err := c.operator.Control(PollDetach); err != nil {
+		if err := operator.Control(PollDetach); err != nil {
 			logger.Printf("NETPOLL: closeCallback[%v,%v] detach operator failed: %v", needLock, needDetach, err)
 		}
 	}
@@ -287,7 +294,7 @@ func (c *connection) closeCallback(needLock, needDetach bool) (err error) {
 
 // register only use for connection register into poll.
 func (c *connection) register() (err error) {
-	err = c.operator.Control(PollReadable)
+	err = c.getOperator().Control(PollReadable)
 	if err != nil {
 		logger.Printf("NETPOLL: connection register failed: %v", err)
 		c.Close()

@@ -160,6 +160,12 @@ func (p *defaultPoll) Close() error {
 	return err
 }
 
+// isClosed is a placeholder on non-linux platforms; live migration is linux
+// only and the closed flag is tracked there.
+func (p *defaultPoll) isClosed() bool {
+	return false
+}
+
 // Trigger implements Poll.
 func (p *defaultPoll) Trigger() error {
 	if atomic.AddUint32(&p.trigger, 1) > 1 {

@@ -49,13 +49,13 @@ func (c *TCPConnection) IsHealthyForReuse(ownerWaitTimeout time.Duration) bool {
 	// Close stops the flushing lock before it can free and recycle the operator.
 	// Recheck after acquiring it so a concurrent close cannot hand us a reused
 	// operator.
-	if !c.IsActive() || c.operator == nil {
+	op := c.getOperator()
+	if !c.IsActive() || op == nil {
 		return false
 	}
 
 	// Try the uncontended owner transition first so the healthy idle fast path
 	// avoids both a clock read and a scheduler yield.
-	op := c.operator
 	if !op.do() {
 		// A poller currently owns the operator. Wait only within the caller's
 		// budget, while continuously rejecting lifecycle transitions that make

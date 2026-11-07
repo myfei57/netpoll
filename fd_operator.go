@@ -17,6 +17,7 @@ package netpoll
 import (
 	"runtime"
 	"sync/atomic"
+	"unsafe"
 )
 
 // FDOperator is a collection of operations on file descriptors.
@@ -42,6 +43,19 @@ type FDOperator struct {
 
 	// poll is the registered location of the file descriptor.
 	poll Poll
+
+	// token is the immutable identity of the current (de)registration. Its
+	// pointer is carried by the kernel inside the epoll event data. Every fresh
+	// registration (add after add, e.g. live migration between pollers) mints
+	// a new token, so events that epoll_wait already returned but that have not
+	// been processed yet become stale once the token is invalidated/replaced.
+	// It also means a reused fd number cannot redirect a stale event to the
+	// new connection that happens to reuse the number.
+	// Access must use atomic load/store.
+	token unsafe.Pointer // *registrationToken
+
+	// gen is the monotonic registration generation, only used for diagnostics.
+	gen uint64
 
 	// protect only detach once
 	detached int32
@@ -99,5 +113,7 @@ func (op *FDOperator) reset() {
 	op.Inputs, op.InputAck = nil, nil
 	op.Outputs, op.OutputAck = nil, nil
 	op.poll = nil
+	atomic.StorePointer(&op.token, nil)
+	op.gen = 0
 	op.detached = 0
 }

@@ -19,6 +19,7 @@ package netpoll
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 )
 
@@ -42,6 +43,10 @@ type manager struct {
 	status   int32       // 0: uninitialized, 1: initializing, 2: initialized
 	balance  loadbalance // load balancing method
 	polls    []Poll      // all the polls
+	// mu protects polls slice replacement (Run/Close/Reset) and is used by
+	// live migration to validate that a target poller belongs to this manager
+	// and is still active.
+	mu sync.RWMutex
 }
 
 // SetNumLoops will return error when set numLoops < 1
@@ -66,12 +71,15 @@ func (m *manager) SetLoadBalance(lb LoadBalance) error {
 
 // Close release all resources.
 func (m *manager) Close() (err error) {
-	for _, poll := range m.polls {
-		err = poll.Close()
-	}
+	m.mu.Lock()
+	polls := m.polls
 	m.numLoops = 0
 	m.balance = nil
 	m.polls = nil
+	m.mu.Unlock()
+	for _, poll := range polls {
+		err = poll.Close()
+	}
 	return err
 }
 
@@ -83,6 +91,8 @@ func (m *manager) Run() (err error) {
 		}
 	}()
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	numLoops := int(atomic.LoadInt32(&m.numLoops))
 	if numLoops == len(m.polls) {
 		return nil
@@ -119,11 +129,31 @@ func (m *manager) Run() (err error) {
 
 // Reset pollers, this operation is very dangerous, please make sure to do this when calling !
 func (m *manager) Reset() error {
-	for _, poll := range m.polls {
+	m.mu.Lock()
+	polls := m.polls
+	m.polls = nil
+	m.mu.Unlock()
+	for _, poll := range polls {
 		poll.Close()
 	}
-	m.polls = nil
 	return m.Run()
+}
+
+// isActivePoll reports whether poll currently belongs to this manager and has
+// not been closed. It is used to validate live migration targets/sources.
+func (m *manager) isActivePoll(poll Poll) bool {
+	dp, ok := poll.(*defaultPoll)
+	if !ok || dp == nil || dp.isClosed() {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, candidate := range m.polls {
+		if candidate == poll {
+			return true
+		}
+	}
+	return false
 }
 
 // Pick will select the poller for use each time based on the LoadBalance.

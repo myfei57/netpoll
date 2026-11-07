@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 type connState = int32
@@ -36,7 +37,9 @@ type connection struct {
 	netFD
 	onEvent
 	locker
-	operator      *FDOperator
+	operator      *FDOperator // always access through getOperator/setOperator
+	migrating     int32       // CAS: a live migration is in progress
+	migMu         sync.RWMutex
 	readTimeout   time.Duration
 	readDeadline  int64 // UnixNano(). it overwrites readTimeout. 0 if not set.
 	readTimer     *time.Timer
@@ -162,7 +165,8 @@ func (c *connection) Skip(n int) (err error) {
 func (c *connection) Release() (err error) {
 	// Check inputBuffer length first to reduce contention in mux situation.
 	// c.operator.do competes with c.inputs/c.inputAck
-	if c.inputBuffer.Len() == 0 && c.operator.do() {
+	operator := c.getOperator()
+	if c.inputBuffer.Len() == 0 && operator.do() {
 		maxSize := c.inputBuffer.calcMaxSize()
 		// Set the maximum value of maxsize equal to mallocMax to prevent GC pressure.
 		if maxSize > mallocMax {
@@ -176,7 +180,7 @@ func (c *connection) Release() (err error) {
 		if c.inputBuffer.Len() == 0 {
 			c.inputBuffer.resetTail(c.maxSize)
 		}
-		c.operator.done()
+		operator.done()
 	}
 	return c.inputBuffer.Release()
 }
@@ -413,18 +417,24 @@ func (c *connection) initNetFD(conn Conn) {
 
 func (c *connection) initFDOperator() {
 	poll := pollmanager.Pick()
+	op := c.newOperator(poll)
+	c.setOperator(op)
+}
+
+// newOperator allocates an operator from poll wired to this connection.
+func (c *connection) newOperator(poll Poll) *FDOperator {
 	op := poll.Alloc()
 	op.FD = c.fd
 	op.OnRead, op.OnWrite, op.OnHup = nil, nil, c.onHup
 	op.Inputs, op.InputAck = c.inputs, c.inputAck
 	op.Outputs, op.OutputAck = c.outputs, c.outputAck
-	c.operator = op
+	return op
 }
 
 func (c *connection) initFinalizer() {
 	c.AddCloseCallback(func(connection Connection) (err error) {
 		c.stop(flushing)
-		c.operator.Free()
+		c.getOperator().Free()
 		if err = c.netFD.Close(); err != nil {
 			logger.Printf("NETPOLL: netFD close failed: %v", err)
 		}
@@ -543,7 +553,7 @@ func (c *connection) flush() error {
 	if c.outputBuffer.IsEmpty() {
 		return nil
 	}
-	err = c.operator.Control(PollR2RW)
+	err = c.controlOperator(PollR2RW)
 	if err != nil {
 		return Exception(err, "when flush")
 	}
@@ -585,9 +595,36 @@ func (c *connection) waitFlush() (err error) {
 		}
 		// if timeout, remove write event from poller
 		// we cannot flush it again, since we don't if the poller is still process outputBuffer
-		c.operator.Control(PollRW2R)
+		_ = c.controlOperator(PollRW2R)
 		return Exception(ErrWriteTimeout, c.remoteAddr.String())
 	}
+}
+
+// getOperator atomically loads the current FDOperator. The owner poller of a
+// connection can change during a live migration, so the pointer must never be
+// read non-atomically from outside initialization.
+func (c *connection) getOperator() *FDOperator {
+	return (*FDOperator)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&c.operator))))
+}
+
+// setOperator atomically publishes a new FDOperator.
+func (c *connection) setOperator(operator *FDOperator) {
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&c.operator)), unsafe.Pointer(operator))
+}
+
+// controlOperator issues an epoll interest change while excluding a concurrent
+// live migration: writers (Flush, write timeout) wait until the operator
+// ownership transfer is complete, then the request lands on the new poller.
+// Poller-driven changes (outputAck/rw2r) use the operator directly because
+// they already execute on the unique owner poller.
+func (c *connection) controlOperator(event PollEvent) error {
+	c.migMu.RLock()
+	defer c.migMu.RUnlock()
+	operator := c.getOperator()
+	if operator == nil {
+		return Exception(ErrConnClosed, "when control operator")
+	}
+	return operator.Control(event)
 }
 
 func (c *connection) getState() connState {

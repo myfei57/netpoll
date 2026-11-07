@@ -45,6 +45,8 @@ func openDefaultPoll() (*defaultPoll, error) {
 	poll.Reset = poll.reset
 	poll.Handler = poll.handler
 	poll.wop = &FDOperator{FD: int(r0)}
+	poll.wop.poll = poll
+	poll.closedCh = make(chan struct{})
 
 	if err = poll.Control(poll.wop, PollReadable); err != nil {
 		_ = syscall.Close(poll.wop.FD)
@@ -58,12 +60,20 @@ func openDefaultPoll() (*defaultPoll, error) {
 
 type defaultPoll struct {
 	pollArgs
-	fd      int            // epoll fd
-	wop     *FDOperator    // eventfd, wake epoll_wait
-	buf     []byte         // read wfd trigger msg
-	trigger uint32         // trigger flag
-	m       sync.Map       //nolint:unused // only used in go:race
-	opcache *operatorCache // operator cache
+	fd       int            // epoll fd
+	wop      *FDOperator    // eventfd, wake epoll_wait
+	buf      []byte         // read wfd trigger msg
+	trigger  uint32         // trigger flag
+	opcache  *operatorCache // operator cache
+	closed   int32          // atomic: 1 after Close
+	closeOne sync.Once
+	closedCh chan struct{} // closed once when Close is called
+	// tasks are executed serially by the poller goroutine between two event
+	// batches, i.e. when no event callback of this poller is in flight. It is
+	// the quiescence mechanism used by live connection migration.
+	taskMu sync.Mutex
+	tasks  []pollFunc
+	goid   int64 // goroutine id of the running Wait loop, 0 if not running
 	// fns for handle events
 	Reset   func(size, caps int)
 	Handler func(events []epollevent) (closed bool)
@@ -91,6 +101,7 @@ func (p *defaultPoll) Wait() (err error) {
 	// init
 	caps, msec, n := barriercap, -1, 0
 	p.Reset(128, caps)
+	atomic.StoreInt64(&p.goid, currentGoid())
 	// wait
 	for {
 		if n == p.size && p.size < 128*1024 {
@@ -109,7 +120,13 @@ func (p *defaultPoll) Wait() (err error) {
 		if p.Handler(p.events[:n]) {
 			return nil
 		}
-		// we can make sure that there is no op remaining if Handler finished
+		// Migration (and similar) jobs run on the poller goroutine only after
+		// the whole event batch has finished, so no callback is still touching
+		// the operator's buffers when a detach/quiesce job observes it.
+		p.runTasks()
+		// we can make sure that there is no op remaining if Handler finished.
+		// Operators retired by the tasks above are returned to the pool here,
+		// after every event that could reference them is done.
 		p.opcache.free()
 	}
 }
@@ -119,7 +136,10 @@ func (p *defaultPoll) handler(events []epollevent) (closed bool) {
 	var err error
 	for i := range events {
 		operator := p.getOperator(0, events[i].GetDataPtr())
-		if operator == nil || !operator.do() {
+		// The token check in getOperator rejects stale registrations; the owner
+		// check is a second line of defense: an operator that has been migrated
+		// to another poller can never be driven by this poller.
+		if operator == nil || operator.poll != p || !operator.do() {
 			continue
 		}
 
@@ -220,8 +240,17 @@ func (p *defaultPoll) handler(events []epollevent) (closed bool) {
 
 // Close will write 10000000
 func (p *defaultPoll) Close() error {
+	p.closeOne.Do(func() {
+		atomic.StoreInt32(&p.closed, 1)
+		close(p.closedCh)
+	})
 	_, err := syscall.Write(p.wop.FD, []byte{1, 0, 0, 0, 0, 0, 0, 0})
 	return err
+}
+
+// isClosed reports whether the poller has been closed.
+func (p *defaultPoll) isClosed() bool {
+	return atomic.LoadInt32(&p.closed) != 0
 }
 
 // Trigger implements Poll.
@@ -244,20 +273,30 @@ func (p *defaultPoll) Control(operator *FDOperator, event PollEvent) error {
 	fd := operator.FD
 	var op int
 	var evt epollevent
-	p.setOperator(evt.GetDataPtr(), operator)
 	switch event {
 	case PollReadable: // server accept a new connection and wait read
 		operator.inuse()
+		// A fresh registration identity: stale events can never be mistaken
+		// for this one.
+		setEventToken(&evt, mintToken(operator))
 		op, evt.Events = syscall.EPOLL_CTL_ADD, syscall.EPOLLIN|syscall.EPOLLRDHUP|syscall.EPOLLERR
 	case PollWritable: // client create a new connection and wait connect finished
 		operator.inuse()
+		setEventToken(&evt, mintToken(operator))
 		op, evt.Events = syscall.EPOLL_CTL_ADD, EPOLLET|syscall.EPOLLOUT|syscall.EPOLLRDHUP|syscall.EPOLLERR
 	case PollDetach: // deregister
-		p.delOperator(operator)
+		setEventToken(&evt, currentToken(operator))
 		op, evt.Events = syscall.EPOLL_CTL_DEL, syscall.EPOLLIN|syscall.EPOLLOUT|syscall.EPOLLRDHUP|syscall.EPOLLERR
+		err := EpollCtl(p.fd, op, fd, &evt)
+		// Invalidate the identity only after the kernel removed the entry; any
+		// event returned afterwards for this fd cannot carry a valid token.
+		invalidateToken(operator)
+		return err
 	case PollR2RW: // connection wait read/write
+		setEventToken(&evt, currentToken(operator))
 		op, evt.Events = syscall.EPOLL_CTL_MOD, syscall.EPOLLIN|syscall.EPOLLOUT|syscall.EPOLLRDHUP|syscall.EPOLLERR
 	case PollRW2R: // connection wait read
+		setEventToken(&evt, currentToken(operator))
 		op, evt.Events = syscall.EPOLL_CTL_MOD, syscall.EPOLLIN|syscall.EPOLLRDHUP|syscall.EPOLLERR
 	}
 	return EpollCtl(p.fd, op, fd, &evt)

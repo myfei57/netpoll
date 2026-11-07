@@ -71,6 +71,27 @@ func (c *operatorCache) freeable(op *FDOperator) {
 	unlock(&c.freelocked)
 }
 
+// recycle enqueues an operator whose caller already moved state 1->0. It must
+// not spin for an external do() holder; callers on the poller goroutine use a
+// CAS and defer the retry instead.
+func (c *operatorCache) recycle(op *FDOperator) bool {
+	if !atomic.CompareAndSwapInt32(&op.state, 1, 0) {
+		return false
+	}
+	op.reset()
+	lock(&c.freelocked)
+	c.freelist = append(c.freelist, op.index)
+	unlock(&c.freelocked)
+	return true
+}
+
+// appendFreelist enqueues an already-reset operator (state 0) for recycling.
+func (c *operatorCache) appendFreelist(op *FDOperator) {
+	lock(&c.freelocked)
+	c.freelist = append(c.freelist, op.index)
+	unlock(&c.freelocked)
+}
+
 func (c *operatorCache) free() {
 	lock(&c.freelocked)
 	defer unlock(&c.freelocked)
